@@ -32,10 +32,14 @@ boop-agent is a small distributed system disguised as a single-server app. Four 
 The front door. One instance per user turn. Its job is to **decide**, not to do.
 
 - Reads the user's message + last 10 turns from Convex.
-- Has three tools via two MCP servers it owns:
-  - `boop-memory.recall(query)` — pull relevant memories.
-  - `boop-memory.write_memory(content, segment, importance, tier?)` — persist a durable fact.
-  - `boop-spawn.spawn_agent(task, integrations[], name?)` — kick off an execution agent.
+- Owns six MCP servers, all in-process (`createSdkMcpServer`):
+  - `boop-memory` — `recall(query)`, `write_memory(content, segment, importance, tier?, supersedes?)`.
+  - `boop-spawn` — `spawn_agent(task, integrations[], name?)`.
+  - `boop-automations` — `create_automation`, `list_automations`, `toggle_automation`, `delete_automation`.
+  - `boop-draft-decisions` — `list_drafts`, `send_draft`, `reject_draft`.
+  - `boop-ack` — `send_ack` (sends a one-liner to iMessage so the user isn't staring at silence while a sub-agent works).
+  - `boop-self` — `get_config`, `set_model`, `set_timezone`, `list_integrations`, `search_composio_catalog`, `inspect_toolkit`.
+- The SDK's built-in tools (`WebSearch`, `WebFetch`, `Bash`, file tools, `Agent`, `Skill`) are explicitly disallowed on the dispatcher so it MUST spawn a sub-agent for external work.
 - Its system prompt drills the DISPATCHER rule: answer directly for chit-chat, spawn an agent for real work.
 - Replies stream through Sendblue back to iMessage (markdown stripped, chunked to 2900 chars).
 
@@ -52,24 +56,26 @@ Spawned per task. Ephemeral. One instance, one job, one result.
 
 ### 3. Memory — `server/memory/`
 
-Three files, three jobs.
+Four files, four jobs.
 
 **`types.ts`** — shape + defaults.
-- Tiers: `short` (decay 5%/day), `long` (2%/day), `permanent` (no decay).
-- Segments: `identity`, `preference`, `relationship`, `project`, `knowledge`, `context`.
+- Tiers: `short`, `long`, `permanent`. Tier governs lifecycle thresholds, not the decay rate directly.
+- Segments: `identity`, `preference`, `correction`, `relationship`, `project`, `knowledge`, `context`.
+- Per-segment defaults (`SEGMENT_DEFAULTS`) supply tier, baseline importance, and `decayRate` when a memory is written. Identity is permanent (importance 0.85, decayRate 0.01); context is short (importance 0.40, decayRate 0.08); the rest sit in `long` with rates between 0.015 and 0.03.
 
-**`tools.ts`** — the `boop-memory` MCP server. `recall` and `write_memory`. Each call emits a `memoryEvents` row so you can watch it live in the dashboard.
+**`tools.ts`** — the `boop-memory` MCP server. `recall` and `write_memory`. Recall does vector search via `convex/memoryRecords.vectorSearch` when an embedding is available, then falls back to substring search. Each call emits a `memoryEvents` row so you can watch it live in the dashboard.
 
-**`extract.ts`** — fires post-turn, **fire-and-forget**. Sends `(userMsg, assistantReply)` to a Haiku/Sonnet pass with an extraction prompt, parses JSON facts, writes each one. The model is told to prefer fewer, higher-quality facts over many trivial ones.
+**`extract.ts`** — fires post-turn, **fire-and-forget**. Sends `(userMsg, assistantReply)` to a Haiku/Sonnet pass with an extraction prompt, parses JSON facts, writes each one. The model is told to prefer fewer, higher-quality facts over many trivial ones. Skipped on `kind: "proactive"` turns so email-derived content doesn't pollute user-fact memory.
 
 **`clean.ts`** — the memory-cleaning loop. Every 6 hours (configurable):
 
-
 1. Load active memories.
-2. Compute an effective score: `importance × decay × reinforcement`.
-   - `decay = max(0, 1 − decayRate × daysSinceAccess)`
-   - `reinforcement = 1 + log(1 + accessCount) × 0.1`
-3. Below threshold `0.15` → archive. Below `0.05` → prune. Permanent memories are skipped.
+2. Compute an effective score `importance × decay × reinforcement` using Ping's adaptive exponential decay:
+   - `adaptiveHalfLife = BASE_HALF_LIFE_DAYS (11.25) × (1 + importance)` — important memories live longer.
+   - `lambda = (ln 2 / adaptiveHalfLife) × DECAY_BETA (0.8) × (1 + decayRate)` — per-segment `decayRate` shortens half-life on top.
+   - `decay = exp(-lambda × daysSinceAccess)`.
+   - `reinforcement = 1 + log(1 + accessCount) × 0.1` — frequently-recalled rows resist decay.
+3. Below threshold `0.15` → archive (skipped for `long`-tier rows). Below `0.05` → prune. Permanent memories are skipped entirely.
 
 This is deliberately simple. Everything sophisticated (consolidation, adversary/judge debates, knowledge graphs, embeddings) was stripped out. Add them back if you need them — the hooks are already in the Convex schema.
 
@@ -112,16 +118,17 @@ HTTP routes for the debug dashboard:
 
 ### 7. Consolidation — `server/consolidation.ts`
 
-Runs daily (or on-demand). A two-agent pipeline over the active memory set:
+Runs daily (or on-demand via `POST /consolidate`). A three-agent pipeline over the active memory set (skipped if fewer than 6 active memories):
 
-1. **Proposer** receives the full memory list and returns proposals:
+1. **Proposer** (Sonnet by default) receives the full memory list and returns proposals:
    - `merge` — combine several entries into one rewrite
    - `supersede` — newer memory replaces older on a conflicting value
    - `prune` — remove redundant or wrong entries
-2. **Judge** approves or rejects each proposal with a rationale.
-3. Approved proposals are applied via `supersedes` on `memoryRecords` (which archives the superseded memories automatically in the upsert mutation).
+2. **Adversary** (Haiku by default — cheap skepticism) sees the proposals and emits per-proposal challenges with a `low | medium | high` severity.
+3. **Judge** (Sonnet) sees both proposals and challenges and approves or rejects each one with a rationale.
+4. Approved proposals are applied via `supersedes` on `memoryRecords` (which archives the superseded memories automatically in the upsert mutation).
 
-Keeps memory sharper over time instead of noisier. The full run is logged in `consolidationRuns`.
+Models are overridable via `BOOP_MODEL` and `BOOP_ADVERSARY_MODEL`. The full run — proposals, challenges, decisions, applied actions, and a snapshot of every referenced memory's content — is captured in `consolidationRuns.details` and broadcast progressively (`proposed → challenged → judged → applied`) so the debug UI can stream the pipeline live.
 
 ### 8. Integrations — Composio (`server/composio.ts`)
 
@@ -129,9 +136,9 @@ Boop delegates all third-party integrations to [Composio](https://composio.dev/?
 
 Flow:
 1. User clicks **Connect** on a toolkit card in the debug dashboard's Connections tab.
-2. Frontend → `POST /composio/toolkits/:slug/authorize` → backend calls `session.authorize(slug)` and returns Composio's hosted `redirectUrl`.
+2. Frontend → `POST /composio/toolkits/:slug/authorize` → `authorizeToolkit(slug)` looks up an existing auth config for the toolkit (or creates a Composio-managed one), then calls `composio.connectedAccounts.initiate(boopUserId(), authConfigId, ...)` and returns its hosted `redirectUrl`. Toolkits without a managed OAuth app surface a 409 with `needsAuthConfig: true` so the UI can prompt the user to register their own at `dashboard.composio.dev`.
 3. Popup opens the redirect URL. User authenticates. Composio stores the tokens on its side.
-4. Popup closes → frontend calls `POST /composio/refresh` → backend re-runs `registerComposioToolkits()` which iterates `connectedAccounts.list({ userIds: [boopUserId()] })` and registers each active toolkit as an `IntegrationModule` keyed by its slug.
+4. Popup closes → frontend calls `POST /composio/refresh` → backend re-runs the registry loader which iterates `connectedAccounts.list({ userIds: [boopUserId()] })` and registers each active toolkit as an `IntegrationModule` keyed by its slug.
 5. `availableIntegrations()` now includes the new slug, so the dispatcher can spawn a sub-agent with it.
 
 On each spawn, `buildComposioIntegrationModule(slug).createServer()` opens a **fresh toolkit-scoped Composio session**:
@@ -140,6 +147,8 @@ On each spawn, `buildComposioIntegrationModule(slug).createServer()` opens a **f
 await composio.create(boopUserId(), {
   toolkits: [slug],            // scope — sub-agent only sees this toolkit's tools
   manageConnections: false,    // don't inject auth-management meta-tools
+  authConfigs: { [slug]: authConfig.id },             // when present (avoids auto-create 400s for BYO toolkits)
+  multiAccount: { enable: true, requireExplicitSelection: true }, // only when ≥2 active connections for this toolkit
 });
 ```
 
@@ -148,9 +157,12 @@ and returns an `McpSdkServerConfigWithInstance` via `createSdkMcpServer`. The su
 HTTP routes (`server/composio-routes.ts`, mounted at `/composio`):
 - `GET  /status` — `{ enabled }`.
 - `GET  /toolkits` — curated list merged with current connection state.
-- `POST /toolkits/:slug/authorize` — returns `{ redirectUrl, connectionId }`.
+- `GET  /toolkits/:slug/tools` — list of tools the toolkit exposes (cached 10 min).
+- `POST /toolkits/:slug/authorize` — returns `{ redirectUrl, connectionId }`. Returns 409 with `needsAuthConfig: true` for toolkits without managed OAuth.
 - `POST /toolkits/:slug/disconnect` — revokes + refreshes registry.
+- `POST /connections/:id/rename` — set a Composio alias on a connection.
 - `POST /refresh` — re-runs the registry loader.
+- `POST /webhook` — Composio webhook receiver (HMAC-verified) for proactive triggers like inbound Gmail.
 
 Env:
 - `COMPOSIO_API_KEY` — required for integrations. Without it, plain chat + memory + automations still work.
@@ -160,22 +172,23 @@ Env:
 
 ## Data model (Convex)
 
-Seven tables. Read `convex/schema.ts` for the exact shape.
+Thirteen tables. Read `convex/schema.ts` for the exact shape.
 
 | Table | Role | Key fields |
 |---|---|---|
 | `messages` | iMessage + chat transcript | conversationId, role, content, turnId |
 | `conversations` | Per-thread metadata | conversationId, messageCount, lastActivityAt |
-| `memoryRecords` | The memory store | memoryId, content, tier, segment, importance, decayRate, accessCount, lifecycle, supersedes |
+| `memoryRecords` | The memory store | memoryId, content, tier, segment, importance, decayRate, accessCount, lifecycle, supersedes, embedding |
 | `executionAgents` | One row per spawned agent | agentId, task, status, tokens, cost |
+| `usageRecords` | Append-only LLM cost log (every model call) | source, model, tokens, costUsd, durationMs |
 | `agentLogs` | Per-agent audit trail | agentId, logType, toolName, accounts, content |
-| `automations` | Scheduled recurring tasks | automationId, schedule, task, integrations, enabled, nextRunAt |
+| `automations` | Scheduled recurring tasks | automationId, schedule, timezone, task, integrations, enabled, nextRunAt |
 | `automationRuns` | One row per automation run | runId, automationId, status, result, agentId |
 | `drafts` | Staged external actions | draftId, kind, summary, payload, status |
-| `consolidationRuns` | History of consolidation passes | runId, proposalsCount, mergedCount, prunedCount |
+| `consolidationRuns` | History of consolidation passes | runId, proposalsCount, mergedCount, prunedCount, details |
 | `sendblueDedup` | Webhook dedup by `message_handle` | handle, claimedAt |
 | `memoryEvents` | Append-only event log for the debug UI | eventType, conversationId, memoryId, data |
-| `settings` | Runtime overrides (model, etc.) read by `server/runtime-config.ts` | key, value, updatedAt |
+| `settings` | Runtime overrides (model, timezone, proactive toggle, webhook secret) read by `server/runtime-config.ts` | key, value, updatedAt |
 
 `memoryRecords` also carries a `vectorIndex("by_embedding")` with 1024-dimension vectors filtered by `lifecycle`.
 
@@ -221,7 +234,7 @@ Steps 6–7 run in parallel where safe. Step 8 is fire-and-forget — the user n
 
 - **No user auth.** This is a single-user tool. Add Clerk or similar if you want multi-tenant.
 - **Single-process scheduler.** The automation loop runs in-process. If you deploy multiple instances, you'll double-fire — add a lock in Convex or run a dedicated scheduler pod.
-- **No intelligence runs** (proactive context gathering) — the original had it, it's complex, and it's opinionated about what it watches. Add it if you want.
+- **Limited proactive surface.** Only inbound Gmail is watched today (`server/proactive-email.ts` + `POST /composio/webhook`). The classifier filters self-sends and low-priority noise, then routes survivors into the dispatcher as a `kind: "proactive"` turn. Other proactive sources (calendar, Slack, etc.) are deliberately not built — add them by registering more Composio triggers.
 - **No knowledge graph** — relationships between memories are represented via `supersedes` only, not a full graph.
 - **Skills library omitted** — too Boop-specific; write your own prompts/policies in `server/*-agent.ts` system prompts.
 
