@@ -17,4 +17,4 @@ data/
 debug/dist/
 .cache/
 .tsbuildinfo
-graphify-out/cache/
+graphify-out/
