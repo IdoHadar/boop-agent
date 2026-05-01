@@ -42,7 +42,7 @@ Every tool call is logged to Convex as usual, so the Agents tab in the debug das
 
 The Connections tab shows a hand-picked set in `server/composio.ts:CURATED_TOOLKITS`. Edit that array to add or remove cards — the slugs must match Composio's toolkit slugs (see `docs.composio.dev/toolkits` for the full catalog).
 
-Current defaults: Gmail, Google Calendar, Google Drive, Google Sheets, Google Docs, Slack, GitHub, Linear, Notion, HubSpot, Salesforce, Discord, Twitter, LinkedIn, Trello, Asana, Jira, Airtable, Figma, Dropbox.
+Current defaults: Gmail, Google Calendar, Google Drive, Google Sheets, Google Docs, Slack, GitHub, Linear, Notion, HubSpot, Discord, Trello, Asana, Jira, Airtable, Figma, Dropbox, Stripe, Supabase, Granola, Salesforce, Twitter / X, LinkedIn.
 
 ---
 
