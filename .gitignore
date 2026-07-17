@@ -18,3 +18,5 @@ data/
 debug/dist/
 .cache/
 .tsbuildinfo
+.pi/npm/
+.pi/tasks/
