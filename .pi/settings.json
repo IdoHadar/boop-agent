@@ -1,0 +1,8 @@
+{
+  "packages": [
+    "npm:pi-codex-web-search",
+    "npm:pi-mcp-adapter",
+    "npm:@tintinweb/pi-subagents",
+    "npm:@tintinweb/pi-tasks"
+  ]
+}
